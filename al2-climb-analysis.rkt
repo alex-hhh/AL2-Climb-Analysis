@@ -56,6 +56,7 @@
 (define *min-climb-score* 0.25)
 (define *min-climb-grade* 1)
 (define *max-climb-separation* 1.0)
+(define *athlete-weight* 90)            ; includes weight of the bike
 
 ;; Shortcut to retrieve a preference for a key, or a default value, if no
 ;; value for the key is stored in the preferences file.
@@ -125,7 +126,11 @@
    top               ; altitude at the top of the climb
    grade             ; the grade of the climb (elevation over distance)
    max-grade         ; maximum grade on the climb (see `join-climbs`)
-   score)            ; FIETS score for the climb (excluding the T - 1000 part), see climbs.md
+   score             ; FIETS score for the climb (excluding the T - 1000 part), see climbs.md
+   energy            ; energy required for the climb to lift 1kg of weight
+                     ; (this needs to be multiplied by the cyclist + bike
+                     ; weight to find the energy required for the climb
+   )
   #:transparent)
 
 (define (climb-distance c)
@@ -145,8 +150,10 @@
          [elevation (- alt-b alt-a)]
          [grade (* (/ elevation (* distance 1000.0)) 100.0)]
          ;[score (* grade grade distance)]
-         [score (/ (* elevation elevation) (* distance 10000.0))])
-    (climb dst-a dst-b alt-a alt-b grade grade score)))
+         [score (/ (* elevation elevation) (* distance 10000.0))]
+         ;; NOTE: don't spend energy on descents
+         [energy (if (> elevation 0) (* (sin (atan elevation distance)) elevation) 0)])
+    (climb dst-a dst-b alt-a alt-b grade grade score energy)))
 
 ;; Construct a list of climb segments from the data frame df -- these will be
 ;; segments of constant grade, but can go either up or down (thus being
@@ -184,7 +191,8 @@
    (climb-top b)
    grade
    (max (climb-max-grade a) (climb-max-grade b))
-   (+ (climb-score a) (climb-score b))))
+   (+ (climb-score a) (climb-score b))
+   (+ (climb-energy a) (climb-energy b))))
 
 ;; Find the true climb segments from RAW-CLIMBS (a list of climbs produced by
 ;; `raw-climb-segments`.  Climbs whose grade is smaller than min-grade are
@@ -444,13 +452,36 @@
        [border 0]
        [spacing 20]))
 
+;; Create a list view of the climbs data with a right click menu attached.
+;; This is somewhat complex, requiring a letrec, since the view needs to know
+;; about the menu and the menu needs to know about the view.  This approach
+;; works for a small menu item, for more complex situations, this would be
+;; wrapped in a class...
 (define climbs-view
-  (new (class qresults-list%
-         (init)(super-new)
-         (define/override (on-select row-index data)
-           (on-climb-selected data)))
-       [parent climb-pane]
-       [pref-tag 'al2-climb-analysis-tool:climbs-view]))
+  (letrec ([on-menu-demand
+            (lambda (m)
+              (define have-selection? (send view get-selected-row-index))
+              (send export-menu-item enable have-selection?))]
+           [climb-operations-menu
+            (new popup-menu%
+                 [title "Climb Operations"]
+                 [demand-callback on-menu-demand])]
+           [export-menu-item
+            (new menu-item%
+                 [parent climb-operations-menu]
+                 [label "Export as GPX..."]
+                 [callback (lambda (m e)
+                             (define selection (send view get-selected-row-index))
+                             (when selection
+                               (on-export-climb-segment selection)))])]
+           [view (new (class qresults-list%
+                        (init)(super-new)
+                        (define/override (on-select row-index data)
+                          (on-climb-selected data)))
+                      [parent climb-pane]
+                      [pref-tag 'al2-climb-analysis-tool:climbs-view]
+                      [right-click-menu climb-operations-menu])])
+    view))
 
 (define climb-controls-pane
   (new vertical-pane%
@@ -469,7 +500,7 @@
        [init-value
         (get-pref 'al2-climb-analysis-tool:elevation-smoothing
                   (exact-round (* *rdp-epsilon* 100)))]
-       [min-value 50]
+      [min-value 50]
        [max-value 500]
        [callback (lambda (c e) (on-rdp-epsilon-changed (/ (send c get-value) 100)))]))
 
@@ -527,6 +558,22 @@
        [enabled (send join-nearby-checkbox get-value)]
        [tooltip "Maximum distance for joining nearby climbs"]
        [callback (lambda (b e) (on-climb-parameters-changed))]))
+
+(define athlete-weight
+  (new (decorate-mixin
+        (decorate-with " kg" #:validate string->number)
+        (validate-mixin
+         string->number
+         (lambda (v) (~r v #:precision 1))
+         (tooltip-mixin text-field%)
+         #:allow-empty? #f))
+       [parent climb-controls-pane]
+       [label "Athlete + Bike Weight "]
+       [init-value
+        (let [(v (get-pref 'al2-climb-analysis-tool:athlete-weight *athlete-weight*))]
+          (~r (if (rational? v) v *athlete-weight*) #:precision 1))]
+       [tooltip "Athlete + Bike Weight (total weight)"]
+       [callback (lambda (b e) (on-athlete-weight-changed))]))
 
 (define map-and-plot-panel
   (new panel:vertical-dragable%
@@ -622,7 +669,17 @@
        (qcolumn
         "Score"
         (lambda (c) (~r (climb-score c) #:precision 2))
-        climb-score)))
+        climb-score)
+       (let ([energy
+              (lambda (c)
+                (define weight (send athlete-weight get-value/validated))
+                (if (rational? weight)
+                    (/ (* weight (climb-energy c)) 1000.0)
+                    ""))])
+         (qcolumn
+          "Energy (kJ)"
+          (lambda (c) (~r (energy c) #:precision 2))
+          energy))))
 
 ;; Setup the defaults for the map: track location is synchronized with the
 ;; track location check box value, and the line with and color of the selected
@@ -682,6 +739,29 @@
   (send the-plot set-overlay-renderers additional-renderers)
   (send the-plot-container set-snips the-plot))
 
+;; Export the selected climb segment as a GPX file, that is export the
+;; contents of the data frame for the selected segment.  This is a callback
+;; for when the user right-clicks on the climbs list and selects the
+;; "export..."  menu.
+(define (on-export-climb-segment index)
+  (when df
+    (let ([path
+           (get-file "Save segment as GPX file"
+                     toplevel #f #f #f '()
+                     '(("GPX Files" "*.gpx")
+                       ("Any" "*.*")))])
+      (when path
+        (let ([climbs (df-get-property df 'climbs)])
+          (when (< index (length climbs))
+            (let ([c (list-ref climbs index)])
+              (match-define (list b e)
+                (df-index-of* df "dst/km" (climb-start c) (climb-end c)))
+              ;; Also export the last point
+              (when (< e (df-row-count df))
+                (set! e (add1 e)))
+              (df-write/gpx df path #:start b #:stop e #:name "GPX Climb Segment")))))))
+  (void))
+
 ;; Callback when the user checks/unchecks the join-nearby-checkbox.  Will
 ;; enable or disable the nearby-distance-field and recalculate the climbs by
 ;; calling `on-climb-parameters-changed`)
@@ -715,6 +795,11 @@
         (send climbs-view set-data climbs)))
     (set! additional-renderers '())
     (construct-the-plot #f (send zoom-to-selection-check-box get-value))))
+
+(define (on-athlete-weight-changed)
+  (let ([climbs (df-get-property df 'climbs)])
+      (when climbs
+        (send climbs-view set-data climbs))))
 
 ;; Called when the user checks/unchecks the track-location-check-box widget,
 ;; sends the information to the map widget.
@@ -803,7 +888,8 @@
      al2-climb-analysis-tool:min-grade
      al2-climb-analysis-tool:min-score
      al2-climb-analysis-tool:join-nearby?
-     al2-climb-analysis-tool:nearby-distance)
+     al2-climb-analysis-tool:nearby-distance
+     al2-climb-analysis-tool:athlete-weight)
    (list
     (send toplevel is-maximized?)
     (send p0 get-percentages)
@@ -815,4 +901,5 @@
     (send min-climb-grade-field get-value/validated)
     (send min-climb-score-field get-value/validated)
     (send join-nearby-checkbox get-value)
-    (send nearby-distance-field get-value/validated))))
+    (send nearby-distance-field get-value/validated)
+    (send athlete-weight get-value/validated))))
