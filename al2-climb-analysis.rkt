@@ -233,7 +233,7 @@
    (lambda (v)
      (match-define (list dst) v)
      (and dst (/ dst 1000.0))))
-  (df-set-sorted df "dst/km" <=)
+  (df-set-sorted df "dst/km" <)
   df)
 
 
