@@ -19,7 +19,7 @@ raco pkg install gui-widget-mixins
 raco pkg install plot-container
 raco pkg install map-widget
 raco pkg install colormaps
-rack pkg install qresults-list
+raco pkg install qresults-list
 ```
 
 You can run the application from DrRacket by opening the
